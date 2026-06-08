@@ -498,6 +498,7 @@ async fn run_http_server(
         .route("/unshield/submit", post(http_unshield_submit))
         .route("/unshield/finalize", post(http_unshield_finalize))  // legacy, kept for compat
         .route("/erc/shield/submit", post(http_erc_shield_submit))
+        .route("/submit_raw", post(http_submit_raw))
         .layer(build_cors_layer())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -794,6 +795,48 @@ async fn http_transfer_submit(
     .await
     .map_err(http_error)?;
     tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.contract.clone()));
+    Ok(Json(HttpTxResponse { tx_hash }))
+}
+
+/// Generic raw-calldata relay: sign + broadcast a pre-built call from the relayer
+/// EOA, paying gas and hiding the user's EOA. Asset-agnostic — the caller supplies
+/// the target contract and the fully-encoded, already-signed calldata, so this
+/// works for any pool/standard (e.g. PERC20 mint/transfer/burn) without the relayer
+/// needing to know the contract's ABI.
+#[derive(Debug, serde::Deserialize)]
+struct HttpSubmitRawRequest {
+    /// Target contract address (0x-prefixed 20 bytes).
+    to: String,
+    /// Fully-encoded calldata (0x-prefixed hex), including the 4-byte selector.
+    data: String,
+    /// Optional gas limit override (defaults to the transfer gas limit).
+    #[serde(default)]
+    gas_limit: Option<u64>,
+    /// Optional wei value to attach (defaults to 0).
+    #[serde(default)]
+    value: Option<u64>,
+}
+
+async fn http_submit_raw(
+    State(cfg): State<Arc<RelayerHttpConfig>>,
+    Json(req): Json<HttpSubmitRawRequest>,
+) -> Result<Json<HttpTxResponse>, (StatusCode, Json<HttpErrorResponse>)> {
+    let calldata = hex::decode(req.data.trim_start_matches("0x"))
+        .map_err(|e| http_error(anyhow!("data is not valid hex: {e}")))?;
+    let tx_hash = send_raw_calldata(
+        &cfg.rpc_url,
+        cfg.chain_id,
+        &cfg.private_key,
+        &req.to,
+        calldata,
+        req.value.unwrap_or(0),
+        cfg.gas_price_gwei,
+        req.gas_limit.unwrap_or(cfg.gas_limit_transfer),
+        &cfg.nonce_cache,
+    )
+    .await
+    .map_err(http_error)?;
+    tokio::spawn(notify_pending_tx(cfg.indexer_url.clone(), tx_hash.clone(), req.to.clone()));
     Ok(Json(HttpTxResponse { tx_hash }))
 }
 
