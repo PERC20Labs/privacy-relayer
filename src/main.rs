@@ -437,6 +437,77 @@ async fn notify_pending_tx(indexer_url: Option<String>, tx_hash: String, contrac
     }
 }
 
+#[derive(Deserialize)]
+struct FrozenRootResp {
+    /// `rt_frozen` as 0x-prefixed little-endian 32-byte hex (indexer convention).
+    root_hex: String,
+}
+
+/// `GET {indexer}/frozen_root?pool={contract}` → `rt_frozen` as **big-endian** 32 bytes.
+///
+/// The indexer publishes the root little-endian (its on-the-wire convention, matching
+/// `/merkle_path` siblings); `pubFields` are big-endian `uint256` words, so we flip it
+/// here to compare in the same order.
+async fn fetch_frozen_root_be(indexer_base: &str, contract: &str) -> Result<[u8; 32]> {
+    let url = format!("{}/frozen_root?pool={}", indexer_base.trim_end_matches('/'), contract);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_default();
+    let resp: FrozenRootResp = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut bytes = parse_hex32(&resp.root_hex)?; // little-endian
+    bytes.reverse(); // → big-endian, matching pubFields[7]
+    Ok(bytes)
+}
+
+/// Pre-broadcast compliance gate. Every action's `pubFields[7]` (rt_frozen) must equal
+/// the indexer's current `/frozen_root`; otherwise the proof was built against a stale
+/// blacklist and the on-chain `_verifyAction` would revert with `BadFrozenRoot`. Catching
+/// it here turns a wasted, reverting broadcast into a clear, actionable error.
+///
+/// Best-effort on availability: if no `indexer_url` is configured, or the indexer is
+/// unreachable, this logs and proceeds (the on-chain check stays the ultimate gate). A
+/// *reachable* indexer reporting a mismatch is a hard error.
+async fn enforce_frozen_compliance(
+    indexer_url: Option<&str>,
+    contract: &str,
+    bundle: &OrchardStoredBundle,
+) -> Result<()> {
+    let Some(base) = indexer_url else { return Ok(()) };
+    let expected_be = match fetch_frozen_root_be(base, contract).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[relayer] frozen-root preflight skipped (indexer unreachable: {e:#}); \
+                 relying on the on-chain BadFrozenRoot guard"
+            );
+            return Ok(());
+        }
+    };
+    for (i, a) in bundle.actions.iter().enumerate() {
+        let pf = a
+            .pub_fields_bn254
+            .as_ref()
+            .ok_or_else(|| anyhow!("action {i} missing pub_fields_bn254"))?;
+        let got = pf
+            .get(7)
+            .ok_or_else(|| anyhow!("action {i} pub_fields_bn254 has fewer than 8 entries"))?;
+        if got.as_slice() != expected_be {
+            return Err(anyhow!(
+                "action {i} pubFields[7] (rt_frozen) does not match the indexer's /frozen_root: \
+                 the proof was built against a stale compliance root. Re-prove against the current \
+                 frozen set (GET /frozen_witness). expected 0x{} got 0x{}",
+                hex::encode(expected_be),
+                hex::encode(got)
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn run_http_server(
     bind: &str,
     rpc_url: &str,
@@ -647,6 +718,7 @@ async fn http_shield_auto(
             cfg.gas_price_gwei,
             cfg.gas_limit_shield,
             &cfg.nonce_cache,
+            cfg.indexer_url.as_deref(),
         )
         .await?;
         tokio::spawn(notify_pending_tx(
@@ -695,6 +767,7 @@ async fn http_shield_submit(
         cfg.gas_price_gwei,
         cfg.gas_limit_shield,
         &cfg.nonce_cache,
+        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -728,6 +801,7 @@ async fn http_transfer_auto(
             cfg.gas_price_gwei,
             cfg.gas_limit_transfer,
             &cfg.nonce_cache,
+            cfg.indexer_url.as_deref(),
         )
         .await?;
         {
@@ -790,6 +864,7 @@ async fn http_transfer_submit(
         cfg.gas_price_gwei,
         cfg.gas_limit_transfer,
         &cfg.nonce_cache,
+        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -870,6 +945,7 @@ async fn http_unshield_submit(
         cfg.gas_price_gwei,
         cfg.gas_limit_unshield,
         &cfg.nonce_cache,
+        cfg.indexer_url.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -956,6 +1032,10 @@ async fn http_erc_shield_submit(
         [0u8; 32]
     };
 
+
+    enforce_frozen_compliance(cfg.indexer_url.as_deref(), &cfg.contract, &req.bundle)
+        .await
+        .map_err(http_error)?;
 
     let actions     = bundle_to_action_args(&req.bundle).map_err(|e| http_error(anyhow!("bundle decode: {e}")))?;
     let binding_sig = bundle_binding_sig(&req.bundle).map_err(|e| http_error(anyhow!("binding_sig: {e}")))?;
@@ -1444,6 +1524,7 @@ async fn shield_submit(
         gas_price_gwei,
         gas_limit,
         &cli_nonce_cache,
+        None,
     )
     .await?;
     println!("eth_sendRawTransaction ok: {tx_hash}");
@@ -1464,7 +1545,10 @@ async fn submit_shield_bundle(
     gas_price_gwei: f64,
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
+    indexer_url: Option<&str>,
 ) -> Result<String> {
+    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+
     let binding_sig = bundle
         .binding_sig_bn254
         .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))?;
@@ -1532,7 +1616,10 @@ async fn submit_transfer_bundle(
     gas_price_gwei: f64,
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
+    indexer_url: Option<&str>,
 ) -> Result<String> {
+    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+
     let binding_sig = bundle
         .binding_sig_bn254
         .ok_or_else(|| anyhow!("bundle.binding_sig_bn254 is missing"))?;
@@ -1605,7 +1692,10 @@ async fn submit_unshield_bundle(
     gas_price_gwei: f64,
     gas_limit: u64,
     nonce_cache: &Arc<Mutex<Option<u64>>>,
+    indexer_url: Option<&str>,
 ) -> Result<String> {
+    enforce_frozen_compliance(indexer_url, contract, bundle).await?;
+
     let binding_sig = bundle
         .binding_sig_bn254
         .ok_or_else(|| anyhow!(
